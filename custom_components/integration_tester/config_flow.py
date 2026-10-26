@@ -16,10 +16,16 @@ from homeassistant.config_entries import (
 from homeassistant.core import callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 from .api import IntegrationTesterGitHubAPI
 from .const import (
     CONF_GITHUB_TOKEN,
+    CONF_INSTALLED_COMMIT,
     CONF_INTEGRATION_DOMAIN,
     CONF_IS_PART_OF_HA_CORE,
     CONF_REFERENCE_TYPE,
@@ -41,10 +47,26 @@ from .helpers import (
     parse_github_url,
     validate_custom_integration,
 )
-from .models import IntegrationInfo, ResolvedReference
+from .models import IntegrationInfo, ParsedGitHubURL, ResolvedReference
+from .repairs import (
+    remove_download_failed_issue,
+    remove_integration_removed_issue,
+    remove_pr_closed_issue,
+)
 from .storage import async_save_token
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _build_title(name: str, ref_type: ReferenceType, ref_value: str) -> str:
+    """Build a config entry title from the integration name and reference."""
+    if ref_type == ReferenceType.PR:
+        ref_str = f"PR #{ref_value}"
+    elif ref_type == ReferenceType.BRANCH:
+        ref_str = f"branch: {ref_value}"
+    else:
+        ref_str = f"commit: {ref_value[:7]}"
+    return f"{name} ({ref_str})"
 
 
 class IntegrationTesterConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -481,21 +503,14 @@ class IntegrationTesterConfigFlow(ConfigFlow, domain=DOMAIN):
                 ref,
             )
 
-        # Determine title
-        ref_type = self._resolved.reference_type
-        if ref_type == ReferenceType.PR:
-            ref_str = f"PR #{self._resolved.reference_value}"
-        elif ref_type == ReferenceType.BRANCH:
-            ref_str = f"branch: {self._resolved.reference_value}"
-        else:
-            ref_str = f"commit: {self._resolved.reference_value[:7]}"
-
         name = (
             self._integration_info.name
             if self._integration_info
             else self._selected_domain
         )
-        title = f"{name} ({ref_str})"
+        title = _build_title(
+            name, self._resolved.reference_type, self._resolved.reference_value
+        )
 
         # Build minimal data (dynamic fields derived by coordinator)
         # Store normalized URL (just owner/repo) since reference_type/value are separate
@@ -521,6 +536,127 @@ class IntegrationTesterConfigFlow(ConfigFlow, domain=DOMAIN):
         if self._resolved:
             return self._resolved.commit_sha
         return ""
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Change the branch, PR or commit tracked by an existing entry."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+        description_placeholders = {
+            "domain": entry.data[CONF_INTEGRATION_DOMAIN],
+            "url": entry.data[CONF_URL],
+        }
+        current_type = entry.data[CONF_REFERENCE_TYPE]
+        current_value = entry.data[CONF_REFERENCE_VALUE]
+
+        if user_input is not None:
+            current_type = user_input[CONF_REFERENCE_TYPE]
+            current_value = user_input[CONF_REFERENCE_VALUE].strip()
+            ref_type = ReferenceType(current_type)
+            domain = entry.data[CONF_INTEGRATION_DOMAIN]
+            is_core = entry.data.get(CONF_IS_PART_OF_HA_CORE, False)
+
+            if (
+                not current_value
+                or (ref_type == ReferenceType.PR and not current_value.isdigit())
+                or (ref_type == ReferenceType.PR and int(current_value) < 1)
+            ):
+                errors[CONF_REFERENCE_VALUE] = "invalid_reference"
+            elif is_core and ref_type != ReferenceType.PR:
+                errors[CONF_REFERENCE_TYPE] = "core_requires_pr"
+            elif (
+                current_type == entry.data[CONF_REFERENCE_TYPE]
+                and current_value == entry.data[CONF_REFERENCE_VALUE]
+            ):
+                return self.async_abort(reason="no_changes")
+
+            if not errors:
+                parsed = parse_github_url(entry.data[CONF_URL])
+                api = IntegrationTesterGitHubAPI(
+                    async_get_clientsession(self.hass),
+                    self.hass.data.get(DOMAIN, {}).get(CONF_GITHUB_TOKEN),
+                )
+                try:
+                    resolved = await api.resolve_reference(
+                        ParsedGitHubURL(
+                            owner=parsed.owner,
+                            repo=parsed.repo,
+                            reference_type=ref_type,
+                            reference_value=current_value,
+                            is_part_of_ha_core=is_core,
+                        )
+                    )
+                    if is_core:
+                        integrations = await api.get_core_pr_integrations(
+                            resolved.owner, resolved.repo, int(current_value)
+                        )
+                        if domain not in integrations:
+                            errors["base"] = "integration_not_in_pr"
+                            description_placeholders["integrations"] = ", ".join(
+                                integrations
+                            )
+                        else:
+                            info = await get_core_integration_info(
+                                api,
+                                resolved.owner,
+                                resolved.repo,
+                                domain,
+                                resolved.commit_sha,
+                            )
+                    else:
+                        info = await validate_custom_integration(
+                            api, resolved.owner, resolved.repo, resolved.commit_sha
+                        )
+                        if info.domain != domain:
+                            errors["base"] = "domain_mismatch"
+                            description_placeholders["new_domain"] = info.domain
+                except ManifestNotFoundError:
+                    errors["base"] = "manifest_not_found"
+                except GitHubAPIError as err:
+                    _LOGGER.error("GitHub API error during reconfigure: %s", err)
+                    errors["base"] = "github_error"
+                    description_placeholders["error"] = str(err)
+
+            if not errors:
+                # Dropping the installed commit makes setup download the new target
+                data = {
+                    k: v for k, v in entry.data.items() if k != CONF_INSTALLED_COMMIT
+                }
+                data[CONF_REFERENCE_TYPE] = current_type
+                data[CONF_REFERENCE_VALUE] = current_value
+                # Issues from the previous target no longer apply
+                remove_pr_closed_issue(self.hass, domain)
+                remove_integration_removed_issue(self.hass, domain)
+                remove_download_failed_issue(self.hass, domain)
+                return self.async_update_reload_and_abort(
+                    entry,
+                    title=_build_title(info.name, ref_type, current_value),
+                    data=data,
+                    reason="reconfigure_successful",
+                )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_REFERENCE_TYPE, default=current_type
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[t.value for t in ReferenceType],
+                            translation_key=CONF_REFERENCE_TYPE,
+                            mode=SelectSelectorMode.DROPDOWN,
+                        )
+                    ),
+                    vol.Required(
+                        CONF_REFERENCE_VALUE, default=current_value
+                    ): cv.string,
+                }
+            ),
+            errors=errors,
+            description_placeholders=description_placeholders,
+        )
 
     @staticmethod
     @callback

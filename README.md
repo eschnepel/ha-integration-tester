@@ -61,6 +61,14 @@ Use a PR URL like `github.com/home-assistant/core/pull/12345` (or from your own 
 | **GitHub Token** | Personal access token (only shown if not already configured) |
 | **Restart after install** | Automatically restart HA after the integration is installed |
 
+### Reconfigure
+
+To switch an existing entry to a different branch, PR, or commit of the same
+repository, use **Reconfigure** on the entry
+(Settings > Devices & Services > Integration Tester > ⋮ > Reconfigure).
+The new target must provide the same integration domain. The new version is
+installed immediately and Home Assistant needs a restart to apply it.
+
 ### Options Flow
 
 The GitHub token can be updated at any time via any Integration Tester
