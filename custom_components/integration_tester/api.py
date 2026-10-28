@@ -15,14 +15,54 @@ from aiogithubapi.exceptions import (
     GitHubRatelimitException,
 )
 
-from .const import HA_CORE_COMPONENTS_PATH, HA_CORE_REPO, PRState, ReferenceType
+from .const import (
+    HA_CORE_COMPONENTS_PATH,
+    HA_CORE_REPO,
+    RECENT_REFERENCES_LIMIT,
+    PRState,
+    ReferenceType,
+)
 from .exceptions import GitHubAPIError, GitHubAuthError, GitHubRateLimitError
-from .models import BranchInfo, CommitInfo, ParsedGitHubURL, PRInfo, ResolvedReference
+from .models import (
+    BranchInfo,
+    CommitInfo,
+    ParsedGitHubURL,
+    PRInfo,
+    ReferenceOption,
+    ResolvedReference,
+)
 
 if TYPE_CHECKING:
     from aiohttp import ClientSession
 
 T = TypeVar("T")
+
+# The REST branches endpoint has no commit dates, so use GraphQL to order by them
+_RECENT_BRANCHES_QUERY = """
+query($owner: String!, $name: String!, $limit: Int!) {
+  repository(owner: $owner, name: $name) {
+    refs(
+      refPrefix: "refs/heads/"
+      first: $limit
+      orderBy: {field: TAG_COMMIT_DATE, direction: DESC}
+    ) {
+      nodes {
+        name
+        target {
+          ... on Commit {
+            committedDate
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _short_date(value: str | None) -> str:
+    """Return the date part of an ISO 8601 timestamp."""
+    return (value or "")[:10] or "unknown"
 
 
 class IntegrationTesterGitHubAPI:
@@ -178,6 +218,87 @@ class IntegrationTesterGitHubAPI:
             commit_author=author.get("name", "unknown"),
             commit_date=author.get("date", ""),
         )
+
+    async def list_recent_references(
+        self,
+        owner: str,
+        repo: str,
+        ref_type: ReferenceType,
+        limit: int = RECENT_REFERENCES_LIMIT,
+    ) -> list[ReferenceOption]:
+        """
+        List the most recently changed branches, open PRs or commits.
+
+        Commits are taken from the default branch. Results are sorted by last
+        change date, newest first.
+
+        Raises:
+            GitHubRateLimitError: If rate limited.
+            GitHubAPIError: For other API errors.
+
+        """
+        if ref_type == ReferenceType.BRANCH:
+            response = await self._call_api(
+                self._client.graphql(
+                    query=_RECENT_BRANCHES_QUERY,
+                    variables={"owner": owner, "name": repo, "limit": limit},
+                ),
+                not_found_message=f"Repository {owner}/{repo} not found",
+            )
+            data = response.data or {}
+            if data.get("errors") or not data.get("data", {}).get("repository"):
+                raise GitHubAPIError(f"Could not list branches of {owner}/{repo}")
+            nodes = data["data"]["repository"]["refs"]["nodes"]
+            nodes = sorted(
+                nodes, key=lambda n: n["target"].get("committedDate", ""), reverse=True
+            )
+            return [
+                ReferenceOption(
+                    value=node["name"],
+                    label=f"{node['name']} ({_short_date(node['target'].get('committedDate'))})",
+                )
+                for node in nodes[:limit]
+            ]
+
+        if ref_type == ReferenceType.PR:
+            response = await self._call_api(
+                self._client.generic(
+                    endpoint=f"/repos/{owner}/{repo}/pulls",
+                    params={
+                        "state": "open",
+                        "sort": "updated",
+                        "direction": "desc",
+                        "per_page": limit,
+                    },
+                ),
+                not_found_message=f"Repository {owner}/{repo} not found",
+            )
+            return [
+                ReferenceOption(
+                    value=str(pr["number"]),
+                    label=f"#{pr['number']} {pr.get('title', '')} ({_short_date(pr.get('updated_at'))})",
+                )
+                for pr in response.data[:limit]
+            ]
+
+        response = await self._call_api(
+            self._client.generic(
+                endpoint=f"/repos/{owner}/{repo}/commits",
+                params={"per_page": limit},
+            ),
+            not_found_message=f"Repository {owner}/{repo} not found",
+        )
+        return [
+            ReferenceOption(
+                value=commit["sha"],
+                label=(
+                    f"{commit['sha'][:7]} "
+                    f"{(commit['commit'].get('message') or '').split(chr(10))[0]} "
+                    f"({_short_date(commit['commit'].get('committer', {}).get('date'))})"
+                ),
+            )
+            for commit in response.data[:limit]
+        ]
 
     async def get_default_branch(self, owner: str, repo: str) -> str:
         """

@@ -37,14 +37,24 @@
       },
       "reconfigure": {
         "title": "Change Tracked Target",
-        "description": "Choose a different branch, pull request or commit of `{url}` to install for `{domain}`.\n\nThe new target must provide the same integration. Home Assistant needs to be restarted after the new version is installed.",
+        "description": "Choose whether to track a branch, pull request or commit of `{url}` for `{domain}`.\n\nThe new target must provide the same integration. Home Assistant needs to be restarted after the new version is installed.",
         "data": {
-          "reference_type": "Target type",
-          "reference_value": "Target"
+          "reference_type": "Target type"
         },
         "data_description": {
-          "reference_type": "Whether to track a branch, a pull request or a commit.",
-          "reference_value": "Branch name, pull request number or commit SHA."
+          "reference_type": "Whether to track a branch, a pull request or a commit."
+        }
+      },
+      "reconfigure_target": {
+        "title": "Select Target",
+        "description": "Select one of the 20 most recently changed {target_type}s of `{url}`, or choose **(not listed)** and enter it below. A selected entry takes precedence over the text field.",
+        "data": {
+          "reference_choice": "Recent {target_type}s",
+          "custom_reference": "Not listed"
+        },
+        "data_description": {
+          "reference_choice": "Sorted by last change, newest first. Pull requests shown are open ones; commits are from the default branch.",
+          "custom_reference": "Branch name, pull request number or commit SHA. Only used when **(not listed)** is selected."
         }
       }
     },
@@ -91,6 +101,11 @@
     }
   },
   "selector": {
+    "reference_choice": {
+      "options": {
+        "_not_listed": "(not listed)"
+      }
+    },
     "reference_type": {
       "options": {
         "branch": "Branch",
