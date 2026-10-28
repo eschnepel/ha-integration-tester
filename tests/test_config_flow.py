@@ -1261,6 +1261,27 @@ class TestReconfigureFlow:
         assert result["errors"] == {"base": "github_error"}
         assert result["description_placeholders"]["error"] == "boom"
 
+    async def test_reconfigure_to_commit(self, hass: HomeAssistant):
+        """Test switching to a commit uses the short SHA in the title."""
+        entry = _reconfigure_entry(hass)
+
+        with (
+            patch(
+                "custom_components.integration_tester.config_flow.IntegrationTesterGitHubAPI"
+            ) as mock_api_cls,
+            patch(
+                "custom_components.integration_tester.async_setup_entry",
+                return_value=True,
+            ),
+        ):
+            _mock_reconfigure_api(mock_api_cls)
+
+            result = await _configure(hass, entry, "commit", custom="abcdef1234567890")
+            await hass.async_block_till_done()
+
+        assert result["reason"] == "reconfigure_successful"
+        assert entry.title == "Lock Code Manager (commit: abcdef1)"
+
     async def test_reconfigure_dropdown_selection(self, hass: HomeAssistant):
         """Test a listed entry is offered newest first and takes precedence."""
         entry = _reconfigure_entry(hass)
